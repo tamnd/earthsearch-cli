@@ -2,172 +2,123 @@ package earthsearch
 
 import (
 	"context"
-	"net/url"
+	"fmt"
 	"strings"
 
 	"github.com/tamnd/any-cli/kit"
 	"github.com/tamnd/any-cli/kit/errs"
 )
 
-// domain.go exposes earthsearch as a kit Domain: a driver that a multi-domain
-// host (ant) enables with a single blank import,
-//
-//	import _ "github.com/tamnd/earthsearch-cli/earthsearch"
-//
-// exactly as a database/sql program enables a driver with `import _
-// "github.com/lib/pq"`. The init below registers it; the host then dereferences
-// earthsearch:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone earthsearch binary (see cli.NewApp), so the
-// binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
 func init() { kit.Register(Domain{}) }
 
-// Domain is the earthsearch driver. It carries no state; the per-run client is
-// built by the factory Register hands kit.
+// Domain is the earthsearch driver for the AWS Earth Search STAC API.
 type Domain struct{}
 
-// Info describes the scheme, the hostnames a pasted link is matched against, and
-// the identity reused for the binary's help and version.
 func (Domain) Info() kit.DomainInfo {
 	return kit.DomainInfo{
 		Scheme: "earthsearch",
 		Hosts:  []string{Host},
 		Identity: kit.Identity{
 			Binary: "earthsearch",
-			Short:  "A command line for earthsearch.",
-			Long: `A command line for earthsearch.
+			Short:  "Search 130M+ satellite imagery scenes via AWS Earth Search STAC API.",
+			Long: `Search 130M+ satellite imagery scenes from Sentinel-2, Landsat, and more.
 
-earthsearch reads public earthsearch data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
+earthsearch reads from the AWS Earth Search STAC (SpatioTemporal Asset Catalog) API,
+including imagery from Sentinel-1, Sentinel-2, Landsat, NAIP, and Copernicus DEM.
+No API key required.`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/earthsearch-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `earthsearch page` and
-	// `ant get earthsearch://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	kit.Handle(app, kit.OpMeta{Name: "search", Group: "read", List: true,
+		Summary: "Search satellite imagery by collection (--collection, --limit)",
+		Args:    []kit.Arg{{Name: "collection", Help: "collection ID e.g. sentinel-2-l2a"}}}, searchItems)
 
-	// List op: members of a page, the home of `earthsearch links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// earthsearch://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	kit.Handle(app, kit.OpMeta{Name: "collections", Group: "read", List: true,
+		Summary: "List available satellite imagery collections"}, listCollections)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
 	c := NewClient()
 	if cfg.UserAgent != "" {
-		c.UserAgent = cfg.UserAgent
+		c.cfg.UserAgent = cfg.UserAgent
 	}
 	if cfg.Rate > 0 {
-		c.Rate = cfg.Rate
+		c.cfg.Rate = cfg.Rate
 	}
 	if cfg.Retries > 0 {
-		c.Retries = cfg.Retries
+		c.cfg.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		c.http.Timeout = cfg.Timeout
 	}
 	return c, nil
 }
 
 // --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Client *Client `kit:"inject"`
+type searchInput struct {
+	Collection string  `kit:"arg"          help:"collection ID e.g. sentinel-2-l2a"`
+	Limit      int     `kit:"flag,inherit" help:"max results"`
+	Client     *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
+type collectionsInput struct {
 	Client *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
-	if err != nil {
-		return mapErr(err)
+func searchItems(ctx context.Context, in searchInput, emit func(*Item) error) error {
+	var collections []string
+	if in.Collection != "" {
+		collections = []string{in.Collection}
 	}
-	return emit(p)
-}
-
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
+	items, _, _, err := in.Client.SearchItems(ctx, collections, in.Limit, "")
 	if err != nil {
-		return mapErr(err)
+		return err
 	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for _, item := range items {
+		if err := emit(item); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
-
-// Classify turns any accepted input — a bare path or a full earthsearch.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
-func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized earthsearch reference: %q", input)
+func listCollections(ctx context.Context, in collectionsInput, emit func(*Collection) error) error {
+	cols, err := in.Client.ListCollections(ctx)
+	if err != nil {
+		return err
 	}
-	return "page", id, nil
+	for _, col := range cols {
+		if err := emit(col); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// Locate is the inverse: the live https URL for a (type, id).
+// --- Resolver ---
+
+func (Domain) Classify(input string) (string, string, error) {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return "", "", errs.Usage("empty earthsearch reference")
+	}
+	return "item", input, nil
+}
+
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
+	switch uriType {
+	case "item":
+		return fmt.Sprintf("https://earth-search.aws.element84.com/v1/search?ids=%s", id), nil
+	default:
 		return "", errs.Usage("earthsearch has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
-}
-
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
-}
-
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
-func mapErr(err error) error {
-	return err
 }
